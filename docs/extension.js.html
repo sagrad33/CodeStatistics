@@ -1,0 +1,270 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <title>JSDoc: Source: extension.js</title>
+
+    <script src="scripts/prettify/prettify.js"> </script>
+    <script src="scripts/prettify/lang-css.js"> </script>
+    <!--[if lt IE 9]>
+      <script src="//html5shiv.googlecode.com/svn/trunk/html5.js"></script>
+    <![endif]-->
+    <link type="text/css" rel="stylesheet" href="styles/prettify-tomorrow.css">
+    <link type="text/css" rel="stylesheet" href="styles/jsdoc-default.css">
+</head>
+
+<body>
+
+<div id="main">
+
+    <h1 class="page-title">Source: extension.js</h1>
+
+    
+
+
+
+    
+    <section>
+        <article>
+            <pre class="prettyprint source linenums"><code>const vscode = require('vscode');
+
+/**
+ * Словарь базовых размеров примитивных типов данных C++ в байтах.
+ * @type {Object&lt;string, number>}
+ */
+const TYPE_SIZES = {
+  char: 1, bool: 1, short: 2,
+  int: 4, float: 4, long: 8, double: 8
+};
+
+/**
+ * Выполняет статический анализ исходного кода на языке C++.
+ * Очищает код от комментариев и строковых литералов, подсчитывает синтаксические
+ * конструкции, оценивает объём статической и динамической памяти, а также
+ * проверяет баланс операций выделения и освобождения памяти.
+ *
+ * @param {string} text Исходный текст C++ файла.
+ * @returns {Object} Объект со статистикой по файлу и оценкой памяти.
+ */
+function analyzeCode(text) {
+  const clean = text.replace(
+    /"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|\/\*[\s\S]*?\*\/|\/\/[^\n]*/g,
+    m => (m.startsWith('/') ? '' : '""')
+  );
+
+  const count = re => (clean.match(re) || []).length;
+
+  const varsMap = {};
+  const constRe = /\b(?:const\s+)?(?:char|short|int|long|float|double)\s+([A-Za-z_]\w*)\s*=\s*(\d+)\b/g;
+  let m;
+
+  while ((m = constRe.exec(clean)) !== null) {
+    varsMap[m.at(1)] = Number(m.at(2));
+  }
+
+  let variables = 0;
+  let memory = 0;
+
+  const varRe = /\b(char|bool|short|int|float|long|double)\s*(\*)?\s*[A-Za-z_]\w*(?:\[(\d+)\])?\s*(?=[;=,])/g;
+
+  while ((m = varRe.exec(clean)) !== null) {
+    variables++;
+    const size = m.at(2) ? 8 : TYPE_SIZES[m.at(1)];
+    memory += size * Number(m.at(3) || 1);
+  }
+
+  let dynamicMemory = 0;
+
+  const newRe = /\bnew\s+(char|bool|short|int|float|long|double)(?:\s*\[\s*(\d+|[A-Za-z_]\w*)\s*\])?/g;
+
+  while ((m = newRe.exec(clean)) !== null) {
+    const rawSize = m.at(2);
+    const arrSize = rawSize
+      ? (/^\d+$/.test(rawSize) ? Number(rawSize) : (varsMap[rawSize] || 0))
+      : 1;
+
+    dynamicMemory += TYPE_SIZES[m.at(1)] * arrSize;
+  }
+
+  const mallocRe = /\bmalloc\s*\(\s*(\d+)\s*\)/g;
+
+  while ((m = mallocRe.exec(clean)) !== null) {
+    dynamicMemory += Number(m.at(1));
+  }
+
+  const newCount = count(/\bnew\b/g);
+  const deleteCount = count(/\bdelete(?:\s*\[\s*\])?\s+[A-Za-z_]\w*\s*;/g);
+  const mallocCount = count(/\bmalloc\s*\(/g);
+  const freeCount = count(/\bfree\s*\(\s*[A-Za-z_]\w*\s*\)/g);
+
+  const rawLines = text.split('\n');
+  const maxLineLength = rawLines.reduce((max, line) => Math.max(max, line.length), 0);
+
+  return {
+    lines: rawLines.length,
+    commentLines: (text.match(/"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|(\/\*[\s\S]*?\*\/|\/\/[^\n]*)/g) || [])
+      .filter(m => m.startsWith('/'))
+      .join('\n').split('\n').filter(Boolean).length,
+
+    functions: count(/\b\w+\s+\w+\s*\([^;{}]*\)\s*\{/g),
+    variables,
+    ifs: count(/\bif\s*\(/g),
+    loops: count(/\bfor\s*\(/g) + count(/\bwhile\s*\(/g),
+    maxLineLength,
+    newCount,
+    deleteCount,
+    mallocCount,
+    freeCount,
+    hasLeak: newCount > deleteCount || mallocCount > freeCount,
+    memory,
+    dynamicMemory,
+    totalMemory: memory + dynamicMemory
+  };
+}
+
+/**
+ * Генерирует HTML-разметку для отображения статистики внутри панели Webview.
+ *
+ * @param {Object} s Объект со статистикой, возвращённый функцией analyzeCode.
+ * @returns {string} Готовая HTML-страница со стилями темы VS Code.
+ */
+function createHtml(s) {
+  const items = [
+    ['Строк', s.lines],
+    ['Комментариев', s.commentLines],
+    ['Функций', s.functions],
+    ['Переменных', s.variables],
+    ['Условий if', s.ifs],
+    ['Циклов', s.loops],
+    ['Макс. строка', `${s.maxLineLength} симв.`]
+  ];
+
+  const leakStatus = s.newCount === 0 &amp;&amp; s.mallocCount === 0
+    ? '&lt;span style="opacity: 0.7;">Динамическое выделение не используется&lt;/span>'
+    : s.hasLeak
+      ? `&lt;span style="color: #f14c4c; font-weight: bold;">⚠️ Возможна утечка&lt;/span>`
+      : `&lt;span style="color: #4ec9b0; font-weight: bold;">✅ Количество операций выделения и освобождения совпадает&lt;/span>`;
+
+  return `&lt;!DOCTYPE html>
+  &lt;html lang="ru">
+  &lt;head>
+    &lt;meta charset="UTF-8">
+    &lt;style>
+      body { font-family: sans-serif; padding: 16px; color: var(--vscode-foreground); }
+      .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 8px; margin: 16px 0; }
+      .card { background: var(--vscode-editor-inactiveSelectionBackground); padding: 12px; border-radius: 6px; }
+      .num { font-size: 20px; font-weight: bold; }
+      .box { padding: 12px; border: 1px solid var(--vscode-panel-border); border-radius: 6px; line-height: 1.7; }
+    &lt;/style>
+  &lt;/head>
+  &lt;body>
+    &lt;h3>Code Statistics&lt;/h3>
+    &lt;div class="grid">
+      ${items.map(([k, v]) => `&lt;div class="card">&lt;div class="num">${v}&lt;/div>&lt;div>${k}&lt;/div>&lt;/div>`).join('')}
+    &lt;/div>
+    &lt;div class="box">
+      &lt;div>Память: &lt;b>${s.memory} байт&lt;/b>&lt;/div>
+      &lt;div>Динамическая память: &lt;b>${s.dynamicMemory} байт&lt;/b>&lt;/div>
+      &lt;div>new: ${s.newCount}, delete: ${s.deleteCount}&lt;/div>
+      &lt;div>malloc: ${s.mallocCount}, free: ${s.freeCount}&lt;/div>
+      &lt;div>Статус: ${leakStatus}&lt;/div>
+      &lt;div style="margin-top: 6px; border-top: 1px solid var(--vscode-panel-border); padding-top: 6px;">
+        Всего: &lt;b>${s.totalMemory} байт&lt;/b>
+      &lt;/div>
+    &lt;/div>
+  &lt;/body>
+  &lt;/html>`;
+}
+
+/**
+ * Точка входа расширения. Регистрирует команду запуска анализатора и
+ * настраивает подписки на события изменения текста и смены активного редактора.
+ *
+ * @param {vscode.ExtensionContext} context Контекст жизненного цикла расширения VS Code.
+ */
+function activate(context) {
+  let panel;
+
+  const update = doc => {
+    if (!panel) return;
+
+    if (!doc || doc.languageId !== 'cpp') {
+      panel.webview.html = `
+        &lt;html>
+          &lt;body style="font-family: sans-serif; padding: 16px; color: var(--vscode-foreground);">
+            &lt;h3>Code Statistics&lt;/h3>
+            &lt;p>Откройте файл C++&lt;/p>
+          &lt;/body>
+        &lt;/html>
+      `;
+      return;
+    }
+
+    panel.webview.html = createHtml(analyzeCode(doc.getText()));
+  };
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand('codeStatistics.analyze', () => {
+      const editor = vscode.window.activeTextEditor;
+
+      if (!editor || editor.document.languageId !== 'cpp') {
+        return vscode.window.showWarningMessage('Откройте файл C++');
+      }
+
+      if (!panel) {
+        panel = vscode.window.createWebviewPanel(
+          'codeStatistics',
+          'Code Statistics',
+          vscode.ViewColumn.Beside,
+          {}
+        );
+
+        panel.onDidDispose(() => {
+          panel = undefined;
+        });
+      }
+
+      update(editor.document);
+    }),
+
+    vscode.workspace.onDidChangeTextDocument(e => {
+      if (e.document === vscode.window.activeTextEditor?.document) {
+        update(e.document);
+      }
+    }),
+
+    vscode.window.onDidChangeActiveTextEditor(e => {
+      if (panel &amp;&amp; e) update(e.document);
+    })
+  );
+}
+
+/**
+ * Вызывается при деактивации расширения.
+ */
+function deactivate() {}
+
+module.exports = { activate, deactivate, analyzeCode };
+</code></pre>
+        </article>
+    </section>
+
+
+
+
+</div>
+
+<nav>
+    <h2><a href="index.html">Home</a></h2><h3>Global</h3><ul><li><a href="global.html#TYPE_SIZES">TYPE_SIZES</a></li><li><a href="global.html#activate">activate</a></li><li><a href="global.html#analyzeCode">analyzeCode</a></li><li><a href="global.html#createHtml">createHtml</a></li><li><a href="global.html#deactivate">deactivate</a></li></ul>
+</nav>
+
+<br class="clear">
+
+<footer>
+    Documentation generated by <a href="https://github.com/jsdoc/jsdoc">JSDoc 4.0.5</a> on Fri Nov 13 2026 01:12:54 GMT+0300 (Москва, стандартное время)
+</footer>
+
+<script> prettyPrint(); </script>
+<script src="scripts/linenumber.js"> </script>
+</body>
+</html>
